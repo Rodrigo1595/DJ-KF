@@ -1,0 +1,49 @@
+transport:
+  ws_host: "127.0.0.1"
+  ws_port: 8765
+
+audio:
+  sample_rate: 48000
+  frame_ms: 20
+  analysis_window_s: 2
+
+vad:
+  mode: 2
+  min_voice_s: 1.2
+  min_silence_ms: 600
+
+mood:
+  smoothing_alpha: 0.25
+  stability_s: 3
+
+cooldowns:
+  global_s: 25
+  per_category_s:
+    calm: 90
+    tense: 45
+    hype: 35
+    chaos: 60
+    meme: 60
+
+sound_selection:
+  no_repeat_minutes: 10
+  weights:
+    tense:
+      - folder: "sounds/tense"
+        weight: 0.7
+      - folder: "sounds/suspense"
+        weight: 0.3
+    hype:
+      - folder: "sounds/hype"
+        weight: 1.0
+    chaos:
+      - folder: "sounds/memes_short"
+        weight: 1.0
+
+modes:
+  CHILL:
+    global_cooldown_multiplier: 1.4
+    meme_enabled: false
+  PARTY:
+    global_cooldown_multiplier: 0.7
+    meme_enabled: true
