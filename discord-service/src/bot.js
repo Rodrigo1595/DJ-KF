@@ -2,6 +2,7 @@ require("dotenv").config();
 const prism = require("prism-media");
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process");
 const { Client, GatewayIntentBits, Events } = require("discord.js");
 
 const {
@@ -18,13 +19,42 @@ const {
 } = require("@discordjs/voice");
 
 // ======================================================
-// ✅ RUTA REAL A /sounds (desde discord-service/src/bot.js)
+// Paths
 // ======================================================
+// DJ-KIUT/sounds  => ../../sounds (desde discord-service/src/bot.js)
 const SOUNDS_BASE_DIR = path.resolve(__dirname, "../../sounds");
 
-// =====================
+// Temp para WAV chunks (dentro de discord-service/)
+const TMP_DIR = path.resolve(__dirname, "../tmp");
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+
+// Python STT (discord-service/python/stt.py)
+const PYTHON_BIN = process.env.PYTHON_BIN || "python";
+const STT_SCRIPT = path.resolve(__dirname, "../python/stt.py");
+
+// ======================================================
+// STT settings
+// ======================================================
+const STT = {
+  enabled: true,
+  // Analiza cada ~2.5s mientras alguien habla (más rápido = más CPU)
+  maxChunkMs: 2500,
+  // Anti-spam por usuario
+  cooldownMs: 3000,
+  // mínimo antes de analizar (1.2s recomendado)
+  minAudioMs: 1200,
+  // timeout del proceso python
+  timeoutMs: 15000,
+};
+
+// userId -> lastSttTs
+const sttCooldownByUser = new Map();
+// guildId -> boolean (evita 10 procesos python en paralelo)
+const sttBusyByGuild = new Map();
+
+// ======================================================
 // Discord Client
-// =====================
+// ======================================================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -34,9 +64,9 @@ const client = new Client({
   ],
 });
 
-// =====================
+// ======================================================
 // Players cache
-// =====================
+// ======================================================
 const players = new Map(); // guildId -> AudioPlayer
 
 function getOrCreatePlayer(guildId) {
@@ -50,12 +80,12 @@ function getOrCreatePlayer(guildId) {
   return player;
 }
 
-// =====================
+// ======================================================
 // Helpers
-// =====================
+// ======================================================
 function safeSoundPath(userInput) {
-  // Bloquea traversal o rutas raras
-  if (!userInput || userInput.includes("..") || userInput.includes("\\")) return null;
+  if (!userInput || userInput.includes("..") || userInput.includes("\\"))
+    return null;
 
   const base = SOUNDS_BASE_DIR;
   const target = path.resolve(base, userInput);
@@ -85,9 +115,73 @@ function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-// =====================
+// WAV writer: PCM 48kHz, 16-bit, stereo
+function writeWav16LE(filePath, pcmBuffer, sampleRate = 48000, channels = 2) {
+  const byteRate = sampleRate * channels * 2;
+  const blockAlign = channels * 2;
+  const dataSize = pcmBuffer.length;
+
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(16, 34);
+
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  fs.writeFileSync(filePath, Buffer.concat([header, pcmBuffer]));
+}
+
+function runSttOnWav(wavPath, timeoutMs = STT.timeoutMs) {
+  return new Promise((resolve) => {
+    const proc = spawn(PYTHON_BIN, [STT_SCRIPT, wavPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    const killTimer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch (_) {}
+    }, timeoutMs);
+
+    proc.stdout.on("data", (d) => (stdout += d.toString()));
+    proc.stderr.on("data", (d) => (stderr += d.toString()));
+
+    proc.on("close", () => {
+      clearTimeout(killTimer);
+
+      if (!stdout.trim()) {
+        if (stderr.trim()) console.log("⚠️ STT stderr:", stderr.trim());
+        return resolve(null);
+      }
+
+      try {
+        const json = JSON.parse(stdout.trim());
+        resolve(json);
+      } catch (e) {
+        console.log("⚠️ STT parse error:", e.message);
+        console.log("⚠️ STT raw stdout:", stdout);
+        resolve(null);
+      }
+    });
+  });
+}
+
+// ======================================================
 // ✅ SOUND_PACKS dinámico (lee /sounds/mood/*)
-// =====================
+// ======================================================
 function loadSoundPacks() {
   const moodDir = path.join(SOUNDS_BASE_DIR, "mood");
   const packs = {};
@@ -113,7 +207,7 @@ function loadSoundPacks() {
       .map((f) => f.name)
       .filter((name) => allowedExt.has(path.extname(name).toLowerCase()));
 
-    const moodKey = folder.toUpperCase(); // calm -> CALM
+    const moodKey = folder.toUpperCase();
     packs[moodKey] = files.map((file) => `mood/${folder}/${file}`);
   }
 
@@ -127,25 +221,17 @@ function loadSoundPacks() {
 
 const SOUND_PACKS = loadSoundPacks();
 
-// =====================
-// Voice capture state
-// =====================
-/**
- * userStreams: userId -> {
- *   guildId,
- *   audioStream, decoder, pcmStream,
- *   startedAt, rmsAccum, rmsCount,
- *   username, lastRms,
- *   lastPcmAt, rmsEma
- * }
- */
-const userStreams = new Map();
-const endTimers = new Map(); // userId -> Timeout
-const speakingListeners = new Map(); // guildId -> { onStart, onEnd }
+// ======================================================
+// Voice capture + chunk recorder state
+// ======================================================
 
-// =====================
-// Paso 5: AutoDJ + Anti-Spam Engine
-// =====================
+const userStreams = new Map();
+const endTimers = new Map();
+const speakingListeners = new Map();
+
+// ======================================================
+// AutoDJ + Anti-Spam Engine
+// ======================================================
 const autoDjEnabled = new Map(); // guildId -> boolean
 const lastGlobalPlayAt = new Map(); // guildId -> timestamp
 const lastMoodPlayAt = new Map(); // `${guildId}:${mood}` -> timestamp
@@ -159,18 +245,14 @@ const AUTO_DJ = {
 };
 
 function canAutoPlay(guildId, mood, moodState) {
-  // 0) STOP jamás debe “autodispararse”
   if (mood === "STOP") return { ok: false, reason: "STOP is manual only" };
 
-  // 1) AutoDJ habilitado?
   const enabled = autoDjEnabled.get(guildId) ?? true;
   if (!enabled) return { ok: false, reason: "AutoDJ OFF" };
 
-  // 2) conexión
   const conn = getVoiceConnection(guildId);
   if (!conn) return { ok: false, reason: "No voice connection" };
 
-  // 3) player libre?
   const player = getOrCreatePlayer(guildId);
   if (player.state?.status === AudioPlayerStatus.Playing) {
     return { ok: false, reason: "Player busy" };
@@ -178,30 +260,24 @@ function canAutoPlay(guildId, mood, moodState) {
 
   const now = Date.now();
 
-  // 4) silencio mínimo
   const lastVoiceAt = moodState?.lastVoiceAt ?? 0;
   if (now - lastVoiceAt < AUTO_DJ.minSilenceMs) {
     return { ok: false, reason: "Not enough silence" };
   }
 
-  // 5) global cooldown
   const lastG = lastGlobalPlayAt.get(guildId) ?? 0;
   if (now - lastG < AUTO_DJ.globalCooldownMs) {
     return { ok: false, reason: "Global cooldown" };
   }
 
-  // 6) per-mood cooldown
   const key = `${guildId}:${mood}`;
   const lastM = lastMoodPlayAt.get(key) ?? 0;
   if (now - lastM < AUTO_DJ.perMoodCooldownMs) {
     return { ok: false, reason: "Mood cooldown" };
   }
 
-  // 7) energía mínima para reaccionar
   if (moodState && moodState.emaEnergy < AUTO_DJ.minEnergyToReact) {
-    if (mood !== "CALM") {
-      return { ok: false, reason: "Energy too low" };
-    }
+    if (mood !== "CALM") return { ok: false, reason: "Energy too low" };
   }
 
   return { ok: true };
@@ -213,7 +289,7 @@ function playSoundAuto(guildId, relativePath, volume = AUTO_DJ.volume) {
 
   const filePath = safeSoundPath(relativePath);
   if (!filePath) {
-    console.log("⚠️ AutoDJ sound missing/invalid:", relativePath);
+    console.log("⚠️ Sound missing/invalid:", relativePath);
     return false;
   }
 
@@ -228,17 +304,16 @@ function playSoundAuto(guildId, relativePath, volume = AUTO_DJ.volume) {
   player.play(resource);
 
   player.once(AudioPlayerStatus.Playing, () => {
-    console.log(`🤖🎧 AutoDJ PLAY: ${relativePath}`);
+    console.log(`🤖🎧 PLAY: ${relativePath}`);
   });
 
   player.once(AudioPlayerStatus.Idle, () => {
-    console.log(`🤖⏹️ AutoDJ END: ${relativePath}`);
+    console.log(`🤖⏹️ END: ${relativePath}`);
   });
 
   return true;
 }
 
-// ✅ STOP inmediato: corta audio y (si existe) responde con pack STOP
 async function stopNow(guildId) {
   const player = getOrCreatePlayer(guildId);
   try {
@@ -247,15 +322,13 @@ async function stopNow(guildId) {
 
   const pack = SOUND_PACKS["STOP"] ?? [];
   const stopSound = pickRandom(pack);
-  if (stopSound) {
-    playSoundAuto(guildId, stopSound, 0.9);
-  }
+  if (stopSound) playSoundAuto(guildId, stopSound, 0.9);
 }
 
-// =====================
-// Mood Analyzer
-// =====================
-const moodStateByGuild = new Map(); // guildId -> state
+// ======================================================
+// Mood Analyzer (Acústico base)
+// ======================================================
+const moodStateByGuild = new Map();
 
 function createMoodState(guildId) {
   return {
@@ -263,64 +336,24 @@ function createMoodState(guildId) {
     tickMs: 200,
     windowMs: 2000,
     stabilityMs: 3000,
-
     history: [],
     emaEnergy: 0,
     emaVoice: 0,
     startsInTick: 0,
-
     lastCandidateMood: "NORMAL",
     candidateSince: Date.now(),
-
     confirmedMood: "NORMAL",
     lastLogAt: 0,
     intervalId: null,
-
     lastVoiceAt: 0,
   };
 }
 
-/**
- * ✅ Mood Heuristics (mejoradas)
- * - CALM: poca voz o energía baja real
- * - SAD: habla suave sostenida (no cero) + pocas interrupciones
- * - CORNY: conversación liviana (energía media-baja) + burst moderado-bajo
- */
 function classifyMood(voiceRatio, energy, burstPerSec) {
-  // ✅ CALM: casi no hay voz o energía mínima real
-  if (voiceRatio < 0.12 || energy < 0.006) return "CALM";
-
-  // ✅ SAD: conversación suave sostenida
-  if (
-    voiceRatio >= 0.28 &&
-    voiceRatio <= 0.75 &&
-    energy >= 0.006 &&
-    energy <= 0.016 &&
-    burstPerSec <= 0.6
-  ) {
-    return "SAD";
-  }
-
-  // ✅ CORNY: conversación liviana / risas suaves, sin caos
-  if (
-    voiceRatio >= 0.22 &&
-    voiceRatio <= 0.70 &&
-    energy >= 0.016 &&
-    energy <= 0.032 &&
-    burstPerSec <= 1.1
-  ) {
-    return "CORNY";
-  }
-
-  // ✅ CHAOS: mucha conversación + interrupciones
+  if (energy < 0.004) return "CALM";
   if (voiceRatio > 0.55 && burstPerSec > 2.2) return "CHAOS";
-
-  // ✅ HYPE: mucha conversación + energía alta
   if (voiceRatio > 0.5 && energy > 0.05) return "HYPE";
-
-  // ✅ TENSE: energía alta pero no todos hablando
   if (voiceRatio < 0.35 && energy > 0.04) return "TENSE";
-
   return "NORMAL";
 }
 
@@ -333,26 +366,15 @@ function startMoodLoop(guildId) {
   state.intervalId = setInterval(() => {
     const now = Date.now();
 
-    // ✅ voz: SOLO streams activos en ESTA guild + PCM reciente
     let activeCount = 0;
     let energySum = 0;
-
-    const VOICE_RMS_MIN = 0.006; // ✅ más estricto
-    const PCM_FRESH_MS = 450;    // ✅ si no hay PCM reciente, no cuenta
+    const VOICE_RMS_MIN = 0.0035;
 
     for (const [, u] of userStreams) {
-      // ✅ FIX: filtrar por guild
       if (u.guildId !== guildId) continue;
-
-      // ✅ FIX: freshness de PCM (evita RMS viejo)
-      const fresh = (now - (u.lastPcmAt ?? 0)) <= PCM_FRESH_MS;
-      if (!fresh) continue;
-
-      // ✅ FIX: usar rmsEma (suavizado) en vez de lastRms
-      const e = u.rmsEma ?? 0;
-      if (e > VOICE_RMS_MIN) {
+      if (u.lastRms && u.lastRms > VOICE_RMS_MIN) {
         activeCount++;
-        energySum += e;
+        energySum += u.lastRms;
       }
     }
 
@@ -366,14 +388,16 @@ function startMoodLoop(guildId) {
       energy: energyInstant,
       starts: state.startsInTick,
     });
-
     state.startsInTick = 0;
 
     const maxLen = Math.ceil(state.windowMs / state.tickMs);
     if (state.history.length > maxLen) state.history.shift();
 
     const n = state.history.length || 1;
-    const voiceTicks = state.history.reduce((acc, x) => acc + (x.hasVoice ? 1 : 0), 0);
+    const voiceTicks = state.history.reduce(
+      (acc, x) => acc + (x.hasVoice ? 1 : 0),
+      0,
+    );
     const voiceRatio = voiceTicks / n;
 
     const energyAvg = state.history.reduce((acc, x) => acc + x.energy, 0) / n;
@@ -381,14 +405,16 @@ function startMoodLoop(guildId) {
     const startsTotal = state.history.reduce((acc, x) => acc + x.starts, 0);
     const burstPerSec = startsTotal / (state.windowMs / 1000);
 
-    // ✅ suavizado general
     const alpha = 0.25;
     state.emaEnergy = alpha * energyAvg + (1 - alpha) * state.emaEnergy;
     state.emaVoice = alpha * voiceRatio + (1 - alpha) * state.emaVoice;
 
-    const candidate = classifyMood(state.emaVoice, state.emaEnergy, burstPerSec);
+    const candidate = classifyMood(
+      state.emaVoice,
+      state.emaEnergy,
+      burstPerSec,
+    );
 
-    // estabilidad
     if (candidate !== state.lastCandidateMood) {
       state.lastCandidateMood = candidate;
       state.candidateSince = now;
@@ -400,10 +426,9 @@ function startMoodLoop(guildId) {
         console.log(
           `📊 Mood CONFIRMADO: ${candidate} (voice_ratio=${state.emaVoice.toFixed(
             2,
-          )} energy=${state.emaEnergy.toFixed(4)} burst=${burstPerSec.toFixed(1)})`,
+          )} energy=${state.emaEnergy.toFixed(3)} burst=${burstPerSec.toFixed(1)})`,
         );
 
-        // AutoDJ: solo en cambios confirmados
         const pack = SOUND_PACKS[candidate] ?? [];
         const sound = pickRandom(pack);
 
@@ -420,13 +445,12 @@ function startMoodLoop(guildId) {
       }
     }
 
-    // log cada ~2s
     if (now - state.lastLogAt >= 2000) {
       state.lastLogAt = now;
       console.log(
         `📈 Mood: ${state.confirmedMood} (voice_ratio=${state.emaVoice.toFixed(
           2,
-        )} energy=${state.emaEnergy.toFixed(4)} burst=${burstPerSec.toFixed(1)})`,
+        )} energy=${state.emaEnergy.toFixed(3)} burst=${burstPerSec.toFixed(1)})`,
       );
     }
   }, state.tickMs);
@@ -440,17 +464,115 @@ function stopMoodLoop(guildId) {
   moodStateByGuild.delete(guildId);
 }
 
-// =====================
+// ======================================================
+// STT-driven ACTIONS
+// ======================================================
+async function handleSttResult(guildId, username, sttJson) {
+  if (!sttJson) return;
+
+  const intent = (sttJson.intent || "").toUpperCase();
+  const mood = (sttJson.mood || "").toUpperCase();
+  const confidence = Number(sttJson.confidence ?? 0);
+  const text = sttJson.text || "";
+
+  if (text.trim()) {
+    console.log(
+      `📝 STT (${username}): "${text}" (intent=${intent} mood=${mood} conf=${confidence.toFixed(
+        2,
+      )})`,
+    );
+  }
+
+  if (intent === "STOP" && confidence >= 0.65) {
+    console.log("🛑 Intent STOP detectado por VOZ");
+    await stopNow(guildId);
+    return;
+  }
+
+  if (mood && confidence >= 0.7 && SOUND_PACKS[mood]?.length) {
+    const moodState = moodStateByGuild.get(guildId);
+    const check = canAutoPlay(guildId, mood, moodState);
+
+    if (check.ok) {
+      const sound = pickRandom(SOUND_PACKS[mood]);
+      if (sound) {
+        const ok = playSoundAuto(guildId, sound, AUTO_DJ.volume);
+        if (ok) {
+          const now = Date.now();
+          lastGlobalPlayAt.set(guildId, now);
+          lastMoodPlayAt.set(`${guildId}:${mood}`, now);
+        }
+      }
+    }
+  }
+}
+
+// ======================================================
+// STT chunk execution (while speaking)
+// ======================================================
+async function maybeRunSttChunk(userId, state) {
+  if (!STT.enabled) return;
+  if (!state) return;
+
+  const now = Date.now();
+  const elapsedMs = now - state.chunkStartedAt;
+
+  if (elapsedMs < STT.minAudioMs) return;
+
+  const last = sttCooldownByUser.get(userId) ?? 0;
+  if (now - last < STT.cooldownMs) return;
+
+  if (sttBusyByGuild.get(state.guildId)) return;
+
+  // 1.2s stereo 48kHz 16-bit ~= 230k bytes
+  const MIN_BYTES = 150_000;
+  if (state.chunkBytes < MIN_BYTES) return;
+
+  const pcmBuffer = Buffer.concat(state.pcmChunks);
+
+  // reset antes (para no perder audio si python se demora)
+  state.pcmChunks = [];
+  state.chunkBytes = 0;
+  state.chunkStartedAt = now;
+
+  const wavPath = path.join(TMP_DIR, `${state.guildId}_${userId}_${Date.now()}.wav`);
+
+  try {
+    writeWav16LE(wavPath, pcmBuffer, 48000, 2);
+
+    sttCooldownByUser.set(userId, now);
+    sttBusyByGuild.set(state.guildId, true);
+
+    const sttJson = await runSttOnWav(wavPath);
+
+    try {
+      fs.unlinkSync(wavPath);
+    } catch (_) {}
+
+    await handleSttResult(state.guildId, state.username, sttJson);
+  } catch (err) {
+    console.log("⚠️ STT chunk error:", err?.message || err);
+    try {
+      fs.unlinkSync(wavPath);
+    } catch (_) {}
+  } finally {
+    sttBusyByGuild.set(state.guildId, false);
+  }
+}
+
+// ======================================================
 // Ready
-// =====================
+// ======================================================
 client.once(Events.ClientReady, () => {
   console.log(`✅ Bot listo como ${client.user.tag}`);
   console.log(`🔊 Sounds base: ${SOUNDS_BASE_DIR}`);
+  console.log(`🧠 STT: ${PYTHON_BIN} ${STT_SCRIPT}`);
+  console.log(`🎙️ Temp WAV: ${TMP_DIR}`);
 });
 
-// =====================
+// ======================================================
 // Commands
-// =====================
+// ======================================================
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
@@ -460,25 +582,21 @@ client.on("messageCreate", async (message) => {
   const contentLower = message.content.toLowerCase();
   const [cmd, arg] = message.content.trim().split(/\s+/, 2);
 
-  // =====================
-  // STOP por chat (texto) o comando
-  // =====================
+  // STOP por chat
   if (cmd === "!stop" || contentLower.includes("callate maldito bot")) {
     stopNow(guild.id);
     return message.reply("😶‍🌫️ ok... me callo.");
   }
 
-  // =====================
-  // !packs
-  // =====================
+  // packs
   if (cmd === "!packs") {
-    const lines = Object.entries(SOUND_PACKS).map(([k, v]) => `• ${k}: ${v.length}`);
+    const lines = Object.entries(SOUND_PACKS).map(
+      ([k, v]) => `• ${k}: ${v.length}`,
+    );
     return message.reply("📦 Packs detectados:\n" + lines.join("\n"));
   }
 
-  // =====================
-  // !autodj on/off
-  // =====================
+  // autodj
   if (cmd === "!autodj") {
     const value = (arg ?? "").toLowerCase();
     if (value !== "on" && value !== "off") {
@@ -493,19 +611,17 @@ client.on("messageCreate", async (message) => {
     return message.reply(`✅ AutoDJ ahora está **${enabled ? "ON" : "OFF"}**`);
   }
 
-  // =====================
-  // !join
-  // =====================
+  // join
   if (cmd === "!join") {
     const voiceChannel = message.member?.voice?.channel;
-    if (!voiceChannel) {
-      return message.reply("⚠️ Debes estar en un canal de voz para que yo me una.");
-    }
+    if (!voiceChannel)
+      return message.reply(
+        "⚠️ Debes estar en un canal de voz para que yo me una.",
+      );
 
     const existing = getVoiceConnection(guild.id);
-    if (existing) {
+    if (existing)
       return message.reply("⚠️ Ya estoy conectado. Usa `!disconnect` primero.");
-    }
 
     const connection = joinVoiceChannel({
       channelId: voiceChannel.id,
@@ -562,62 +678,56 @@ client.on("messageCreate", async (message) => {
         audioStream,
         decoder,
         pcmStream,
-
-        startedAt: Date.now(),
-        rmsAccum: 0,
-        rmsCount: 0,
-        lastRms: 0,
-
-        // ✅ nuevos campos anti-falsos positivos
-        lastPcmAt: 0,
-        rmsEma: 0,
-
         username,
+        lastRms: 0,
+        pcmChunks: [],
+        chunkStartedAt: Date.now(),
+        chunkBytes: 0,
       };
 
       userStreams.set(userId, state);
 
       pcmStream.on("data", (pcmChunk) => {
         const rms = computeRmsInt16LE(pcmChunk);
-
-        // ✅ FIX: freshness de PCM
-        state.lastPcmAt = Date.now();
-
-        // ✅ FIX: guardado RMS + suavizado por usuario
         state.lastRms = rms;
-        const a = 0.35; // smoothing factor
-        state.rmsEma = a * rms + (1 - a) * (state.rmsEma ?? 0);
 
-        state.rmsAccum += rms;
-        state.rmsCount++;
+        state.pcmChunks.push(pcmChunk);
+        state.chunkBytes += pcmChunk.length;
 
-        const elapsed = (Date.now() - state.startedAt) / 1000;
-        if (elapsed >= 1) {
-          const avgRms = state.rmsCount > 0 ? state.rmsAccum / state.rmsCount : 0;
-
-          // (solo debug)
-          if (avgRms > 0.005) console.log(`   ↳ RMS(avg): ${avgRms.toFixed(4)} | EMA: ${state.rmsEma.toFixed(4)}`);
-
-          state.rmsAccum = 0;
-          state.rmsCount = 0;
-          state.startedAt = Date.now();
+        const elapsed = Date.now() - state.chunkStartedAt;
+        if (elapsed >= STT.maxChunkMs) {
+          // Dispara análisis en vivo (sin bloquear el stream)
+          maybeRunSttChunk(userId, state);
         }
       });
 
       pcmStream.on("error", (err) => console.error("PCM stream error:", err));
-      audioStream.on("error", (err) => console.error("Receiver stream error:", err));
+      audioStream.on("error", (err) =>
+        console.error("Receiver stream error:", err),
+      );
     };
 
     const onSpeakingEnd = (userId) => {
-      const t = setTimeout(() => {
+      const t = setTimeout(async () => {
         const state = userStreams.get(userId);
         if (!state) return;
 
         console.log(`🛑 Terminó de hablar: ${state.username}`);
 
-        try { state.pcmStream?.destroy(); } catch (_) {}
-        try { state.decoder?.destroy(); } catch (_) {}
-        try { state.audioStream?.destroy(); } catch (_) {}
+        // Último intento STT con lo pendiente
+        try {
+          await maybeRunSttChunk(userId, state);
+        } catch (_) {}
+
+        try {
+          state.pcmStream?.destroy();
+        } catch (_) {}
+        try {
+          state.decoder?.destroy();
+        } catch (_) {}
+        try {
+          state.audioStream?.destroy();
+        } catch (_) {}
 
         userStreams.delete(userId);
         endTimers.delete(userId);
@@ -630,15 +740,12 @@ client.on("messageCreate", async (message) => {
     receiver.speaking.on("end", onSpeakingEnd);
     speakingListeners.set(guild.id, { onStart: onSpeakingStart, onEnd: onSpeakingEnd });
 
-    // ✅ iniciar mood loop ya conectado
     startMoodLoop(guild.id);
 
     return message.reply(`✅ Conectado a **${voiceChannel.name}**`);
   }
 
-  // =====================
-  // !leave / !disconnect
-  // =====================
+  // leave
   if (cmd === "!leave" || cmd === "!disconnect") {
     const conn = getVoiceConnection(guild.id);
     if (!conn) return message.reply("⚠️ No estoy conectado a ningún canal.");
@@ -655,29 +762,31 @@ client.on("messageCreate", async (message) => {
     }
 
     for (const [, t] of endTimers) {
-      try { clearTimeout(t); } catch (_) {}
+      try {
+        clearTimeout(t);
+      } catch (_) {}
     }
     endTimers.clear();
 
-    // ✅ destruir streams SOLO de esta guild
     for (const [userId, state] of userStreams) {
       if (state.guildId !== guild.id) continue;
-
-      try { state.pcmStream?.destroy(); } catch (_) {}
-      try { state.decoder?.destroy(); } catch (_) {}
-      try { state.audioStream?.destroy(); } catch (_) {}
-
+      try {
+        state.pcmStream?.destroy();
+      } catch (_) {}
+      try {
+        state.decoder?.destroy();
+      } catch (_) {}
+      try {
+        state.audioStream?.destroy();
+      } catch (_) {}
       userStreams.delete(userId);
     }
 
-    // Reproducir sonido STOP antes de desconectar y esperar hasta 5s máximo
     try {
       stopNow(guild.id);
       const player = getOrCreatePlayer(guild.id);
       await entersState(player, AudioPlayerStatus.Idle, 5000);
-    } catch (err) {
-      console.log("⚠️ Timeout o error esperando stop sound:", err);
-    }
+    } catch (_) {}
 
     conn.destroy();
     players.delete(guild.id);
@@ -685,16 +794,17 @@ client.on("messageCreate", async (message) => {
     return message.reply("✅ Me desconecté del canal de voz.");
   }
 
-  // =====================
-  // !play mood/tense/xxx.mp3 (manual)
-  // =====================
+  // play manual
   if (cmd === "!play") {
     const conn = getVoiceConnection(guild.id);
-    if (!conn) return message.reply("⚠️ Primero usa `!join` para que me conecte.");
+    if (!conn)
+      return message.reply("⚠️ Primero usa `!join` para que me conecte.");
 
     const filePath = safeSoundPath(arg);
     if (!filePath) {
-      return message.reply("⚠️ Archivo inválido o no existe. Ej: `!play mood/tense/suspense1.mp3`");
+      return message.reply(
+        "⚠️ Archivo inválido o no existe. Ej: `!play mood/tense/suspense1.mp3`",
+      );
     }
 
     const player = getOrCreatePlayer(guild.id);
@@ -707,21 +817,20 @@ client.on("messageCreate", async (message) => {
     resource.volume?.setVolume(0.9);
     player.play(resource);
 
-    player.once(AudioPlayerStatus.Playing, () => {
-      console.log("▶️ Reproduciendo:", filePath);
-    });
-
-    player.once(AudioPlayerStatus.Idle, () => {
-      console.log("⏹️ Terminado:", filePath);
-    });
+    player.once(AudioPlayerStatus.Playing, () =>
+      console.log("▶️ Reproduciendo:", filePath),
+    );
+    player.once(AudioPlayerStatus.Idle, () =>
+      console.log("⏹️ Terminado:", filePath),
+    );
 
     return message.reply(`🎧 Reproduciendo: **${arg}**`);
   }
 });
 
-// =====================
+// ======================================================
 // Login
-// =====================
+// ======================================================
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
   console.error("❌ Falta DISCORD_TOKEN en el archivo .env");
